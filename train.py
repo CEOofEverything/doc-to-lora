@@ -10,6 +10,12 @@ from functools import partial
 import numpy as np
 import torch
 import wandb
+try:
+    import comet_ml
+    _HAS_COMET = True
+except ImportError:
+    comet_ml = None
+    _HAS_COMET = False
 from datasets import disable_caching, interleave_datasets
 from peft import PeftModel
 from transformers import (
@@ -64,6 +70,20 @@ from ctx_to_lora.utils import (
 logger = logging.getLogger()
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
+
+
+def _resolve_report_to(report_to):
+    """Normalise HF Trainer's report_to into a list of integration names."""
+    if isinstance(report_to, str):
+        if report_to == "all":
+            out = ["wandb"]
+            if _HAS_COMET:
+                out.append("comet_ml")
+            return out
+        if report_to in ("none", ""):
+            return []
+        return [report_to]
+    return list(report_to or [])
 
 
 def main():
@@ -422,18 +442,40 @@ def main():
     logger.info("Compiling base_model")
     base_model.compile(fullgraph=True, mode="max-autotune")
 
+    active_loggers = _resolve_report_to(training_args.report_to)
+
     if LOCAL_RANK == 0:
-        wandb.init(
-            project=os.getenv("WANDB_PROJECT"),
-            name=run_name,
-            group=run_name,
-            config=args,
-            tags=os.getenv("WANDB_TAGS").split(","),
-            notes=ctx_args.notes,
-            resume="allow",
-        )
+        if "wandb" in active_loggers:
+            wandb.init(
+                project=os.getenv("WANDB_PROJECT"),
+                name=run_name,
+                group=run_name,
+                config=args,
+                tags=os.getenv("WANDB_TAGS").split(","),
+                notes=ctx_args.notes,
+                resume="allow",
+            )
+        if "comet_ml" in active_loggers:
+            if not _HAS_COMET:
+                raise RuntimeError(
+                    "report_to includes 'comet_ml' but comet_ml is not installed; "
+                    "run `uv pip install comet_ml`"
+                )
+            comet_tags_env = os.getenv("COMET_TAGS") or os.getenv("WANDB_TAGS") or ""
+            comet_exp = comet_ml.start(
+                project_name=os.getenv("COMET_PROJECT_NAME"),
+                workspace=os.getenv("COMET_WORKSPACE"),
+                experiment_config=comet_ml.ExperimentConfig(
+                    name=run_name,
+                    tags=[t for t in comet_tags_env.split(",") if t],
+                ),
+            )
+            comet_exp.log_parameters(args)
+            if ctx_args.notes:
+                comet_exp.log_other("notes", ctx_args.notes)
     else:
-        wandb.init(mode="disabled")
+        if "wandb" in active_loggers:
+            wandb.init(mode="disabled")
 
     train_model(
         model,
@@ -458,6 +500,11 @@ if __name__ == "__main__":
     os.environ["WANDB_PROJECT"] = os.getenv("WANDB_PROJECT") or "ctx_to_lora"
     os.environ["WANDB_WATCH"] = ""
     os.environ["WANDB_CONSOLE"] = "off"
+    os.environ["COMET_PROJECT_NAME"] = (
+        os.getenv("COMET_PROJECT_NAME")
+        or os.getenv("WANDB_PROJECT")
+        or "ctx_to_lora"
+    )
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     os.environ["OMP_NUM_THREADS"] = "23"
     torch._dynamo.config.capture_scalar_outputs = True

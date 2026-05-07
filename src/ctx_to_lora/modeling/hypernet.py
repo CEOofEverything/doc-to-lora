@@ -64,7 +64,7 @@ from ctx_to_lora.utils import (
     get_peft_modules,
 )
 
-USE_RANDOM_REPR = True  # flag for development
+USE_RANDOM_REPR = False  # flag for development (experimental random-repr Perceiver branch; needs per_rank_gen=False)
 
 logger = logging.getLogger()
 
