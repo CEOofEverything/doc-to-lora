@@ -237,6 +237,8 @@ def self_generate(
 
     if args.debug:
         ds = ds.take(10)
+    elif args.max_samples is not None and args.max_samples > 0:
+        ds = ds.take(args.max_samples)
 
     ds = ds.filter(filter_none, batched=False, num_proc=8)
 
@@ -270,6 +272,12 @@ def self_generate(
     # What is the point of definition above???
     questions = [q_list for q_list in ds["prompts"] if len(q_list) > 0]
 
+    has_golden = "responses" in ds.column_names
+    responses_golden_all = (
+        [sample["responses"] for sample in ds] if has_golden
+        else [None] * len(ctxs)
+    )
+
     print(f"Loaded {len(ctxs)} contexts and {len(questions)} questions")
 
     k = 16
@@ -281,6 +289,7 @@ def self_generate(
 
         chunk_ctxs = ctxs[start:(start + chunk_size)]
         chunk_questions = questions[start:(start + chunk_size)]
+        chunk_responses_golden = responses_golden_all[start:(start + chunk_size)]
         chunk_messages = create_messages(
             chunk_ctxs,
             chunk_questions,
@@ -329,6 +338,7 @@ def self_generate(
             chunk_questions,
             chunk_messages,
             k,
+            chunk_responses_golden,
         )
 
 
@@ -347,6 +357,7 @@ def execute_qa_generation(
     questions,
     messages,
     k,
+    responses_golden=None,
 ):
     completions = llm.chat(
         messages,
@@ -368,13 +379,16 @@ def execute_qa_generation(
             "response_start_end": [],
             "logprobs_vals": [],
             "logprobs_indices": [],
+            "responses_golden": [],
         }
         for ctx, ctx_ids in zip(ctxs, ctx_ids)
     }
+    if responses_golden is None:
+        responses_golden = [None] * len(ctxs)
     c = 0
     n_skips = 0
     sys_start = None
-    for ctx, q_list in zip(ctxs, questions):
+    for ctx_idx, (ctx, q_list) in enumerate(zip(ctxs, questions)):
         # self_gen_data[ctx]["ctx_ids"] = ctx_ids
         for i, _ in enumerate(q_list):
             # response = completions[c + i].outputs[0].text
@@ -440,6 +454,9 @@ def execute_qa_generation(
             self_gen_data[ctx]["response_start_end"].append((res_start, res_end))
             self_gen_data[ctx]["logprobs_vals"].append(logp_vals)
             self_gen_data[ctx]["logprobs_indices"].append(logp_indices)
+            golden_i = responses_golden[ctx_idx]
+            if golden_i is not None and i < len(golden_i):
+                self_gen_data[ctx]["responses_golden"].append(golden_i[i])
 
         c += i + 1
 
@@ -455,6 +472,7 @@ def execute_qa_generation(
             # "prompt_start_end": self_gen_data[ctx]["prompt_start_end"],
             "logprobs_vals": self_gen_data[ctx]["logprobs_vals"],
             "logprobs_indices": self_gen_data[ctx]["logprobs_indices"],
+            "responses_golden": self_gen_data[ctx]["responses_golden"],
         }
         for ctx, q_list in zip(ctxs, questions)
     ]
@@ -572,6 +590,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=256,
         help="Maximum number of new tokens to generate (default: 256)",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=-1,
+        help=(
+            "Cap number of contexts (samples) processed per dataset. "
+            "<=0 means no limit. Ignored when --debug is set (debug forces 10)."
+        ),
     )
     return parser.parse_args()
 

@@ -125,6 +125,18 @@ DS_KWARGS = {
             split="train",
         )
     ),
+    "diverse_sft": dict(
+        train=dict(
+            path="parquet",
+            data_files="data/raw_datasets/diverse_sft/train/ds.parquet",
+            split="train",
+        ),
+        validation=dict(
+            path="parquet",
+            data_files="data/raw_datasets/diverse_sft/validation/ds.parquet",
+            split="train",
+        ),
+    ),
     "babilong_qa_1": dict(
         train_0k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="0k"),
         train_1k=dict(path="RMT-team/babilong-1k-samples", split="qa1", name="1k"),
