@@ -1,0 +1,24 @@
+# LoRA
+lora_r: 8
+lora_dropout: 0.0
+target_modules:
+  - down_proj
+
+# Plain `diverse_sft` has no logprobs_vals → train+eval on CE.
+use_kl_loss: false
+
+ctx_encoder_type: per_layer_activations
+n_latent_queries: 8
+num_blocks: 9
+num_self_attn_per_block: 0
+
+gradient_accumulation_steps: 11
+max_packed_inp_len: 6144
+max_packed_ctx_len: 6144
+
+# data
+train_ds_names:
+  - diverse_sft
+
+val_ds_names:
+  - diverse_sft

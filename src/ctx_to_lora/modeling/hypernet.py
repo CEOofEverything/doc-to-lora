@@ -1,4 +1,5 @@
 import logging
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import partial
@@ -64,7 +65,7 @@ from ctx_to_lora.utils import (
     get_peft_modules,
 )
 
-USE_RANDOM_REPR = False  # flag for development (experimental random-repr Perceiver branch; needs per_rank_gen=False)
+USE_RANDOM_REPR = os.environ.get("D2L_USE_RANDOM_REPR", "0").lower() in ("1", "true", "yes")  # flag for development (experimental random-repr Perceiver branch; needs per_rank_gen=False)
 
 logger = logging.getLogger()
 
@@ -604,12 +605,17 @@ class ModulatedPretrainedModel(nn.Module):
                 logger.debug(f"Applying LoRA forward to {name}")
                 module.forward_orig = module.forward
                 module.patched_forward = True
+                # The base patched partial has self/lora_dropout_p/scaling bound;
+                # apply_lora_to_layers / apply_random_repr layer per-batch kwargs
+                # on top. We snapshot it here so each apply_* call can reset to
+                # this exact form instead of stacking wrappers across batches.
                 module.forward = partial(
                     forward_fn,
                     self=module,
                     lora_dropout_p=self.peft_config.lora_dropout,
                     scaling=self.peft_config.lora_alpha,
                 )
+                module.forward_lora_base = module.forward
 
     def _init_model(self):
         self.hypernet = (
@@ -729,31 +735,45 @@ class ModulatedPretrainedModel(nn.Module):
     ):
         with torch.no_grad():
             if USE_RANDOM_REPR:
-                # print(f"{ctx_position_ids.size() = }")
-                position_ids = ctx_position_ids.squeeze(0)
-                ctx_lens = position_ids[torch.where(position_ids == 0)[0][1:] - 1]
-                ctx_lens = torch.cat(  # [tot_chunks]
-                    (ctx_lens, torch.tensor([position_ids[-1]], device=ctx_lens.device))
-                )
-                ctx_lens += 1
-                tot_len = ctx_lens.sum().item()
-                tot_chunks = n_ctx_chunks.sum().item()
-
                 n_ctx = len(n_ctx_chunks)
+                if ctx_position_ids is None:
+                    # eval/generation path: ctx_ids is [n_chunks, padded_len] (padded),
+                    # ctx_attn_mask masks out padding. Compute repr_seeds as the sum of
+                    # valid token ids per parent context — same semantics as the packed
+                    # path below, just derived from the unpacked geometry.
+                    assert ctx_attn_mask is not None, (
+                        "USE_RANDOM_REPR eval path requires ctx_attn_mask"
+                    )
+                    chunk_seeds = (ctx_ids * ctx_attn_mask).sum(dim=1)  # [n_chunks]
+                    chunk_to_ctx = torch.repeat_interleave(
+                        torch.arange(n_ctx, device=ctx_ids.device),
+                        n_ctx_chunks,
+                    )
+                    self.repr_seeds = torch.zeros(
+                        n_ctx, dtype=ctx_ids.dtype, device=ctx_ids.device
+                    )
+                    self.repr_seeds.scatter_add_(0, chunk_to_ctx, chunk_seeds)
+                else:
+                    position_ids = ctx_position_ids.squeeze(0)
+                    ctx_lens = position_ids[torch.where(position_ids == 0)[0][1:] - 1]
+                    ctx_lens = torch.cat(  # [tot_chunks]
+                        (ctx_lens, torch.tensor([position_ids[-1]], device=ctx_lens.device))
+                    )
+                    ctx_lens += 1
+                    tot_len = ctx_lens.sum().item()
+                    tot_chunks = n_ctx_chunks.sum().item()
 
-                index = torch.repeat_interleave(
-                    torch.arange(n_ctx, device=ctx_ids.device),
-                    n_ctx_chunks, dim=0, output_size=tot_chunks
-                )
-                index = torch.repeat_interleave(
-                    index, ctx_lens, dim=0, output_size=tot_len
-                )
-                self.repr_seeds = torch.zeros(n_ctx, dtype=ctx_ids.dtype, device=ctx_ids.device)
-
-                # print(f"{index = }")
-                # print(f"{ctx_ids.size() = }")
-
-                self.repr_seeds.scatter_add_(0, index, ctx_ids.squeeze(0))
+                    index = torch.repeat_interleave(
+                        torch.arange(n_ctx, device=ctx_ids.device),
+                        n_ctx_chunks, dim=0, output_size=tot_chunks
+                    )
+                    index = torch.repeat_interleave(
+                        index, ctx_lens, dim=0, output_size=tot_len
+                    )
+                    self.repr_seeds = torch.zeros(
+                        n_ctx, dtype=ctx_ids.dtype, device=ctx_ids.device
+                    )
+                    self.repr_seeds.scatter_add_(0, index, ctx_ids.squeeze(0))
                 self.generator = torch.Generator(device=ctx_ids.device)
 
             ctx_encoder_kwargs = dict(

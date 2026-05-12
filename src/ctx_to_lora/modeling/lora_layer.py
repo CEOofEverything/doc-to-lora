@@ -241,11 +241,14 @@ def random_repr_forward(
     # bs of x should be 1 in this case
     base_out = nn.Linear.forward(self, x, *args, **kwargs)
 
+    # coeffs/repr_A/repr_B come from hypernet under bf16 autocast; x may be fp32
+    # at eval (run_eval disables bf16). Cast x to compute dtype to match the
+    # einsum operands, then cast the delta back to base_out.dtype at the end.
+    compute_dtype = coeffs.dtype
+    x = x.to(compute_dtype)
+
     n_reprs = coeffs.shape[1]
     r = 8
-
-    # stat = torch.cuda.memory.memory_allocated(device=coeffs.device)
-    # print(f"Starting forward pass for {layer_idx = } with {stat / (1024 ** 3):.1f}Gb allocated", flush=True)
 
     ctx_idx = torch.repeat_interleave(
         torch.arange(len(n_ctx_chunks), device=x.device),
@@ -258,7 +261,7 @@ def random_repr_forward(
     delta_x = torch.zeros(
         (1, tot_len, self.out_features),
         device=x.device,
-        dtype=x.dtype,
+        dtype=compute_dtype,
     )
 
     start = 0
@@ -304,10 +307,7 @@ def random_repr_forward(
         start = end
         i += 1
 
-    # stat = torch.cuda.memory.memory_allocated(device=coeffs.device)
-    # print(f"Finishing forward pass for {layer_idx = } with {stat / (1024 ** 3):.1f}Gb allocated", flush=True)
-
-    return base_out + delta_x
+    return (base_out + delta_x.to(base_out.dtype)).to(base_out.dtype)
 
 
 def apply_random_repr(
@@ -316,43 +316,82 @@ def apply_random_repr(
     # combined_coeffs: Float[Tensor, "n_layers n_modules tot_chunks"],
     coeffs: Float[Tensor, "tot_chunks n_layers n_modules n_reprs"],
     n_queries: Integer[Tensor, "n_ctx"],
-    position_ids: Integer[Tensor, "bs seq_len"],
+    position_ids: Integer[Tensor, "bs seq_len"] | None,
     n_ctx_chunks: Integer[Tensor, "n_ctx"],
     repr_seeds: Integer[Tensor, "n_ctx"],
     generator: torch.Generator,
 ) -> None:
     layers = get_layers(model)
-
-    # removed checking if position_ids is None as they should not be
-    position_ids = position_ids.squeeze(0)
-    seq_lens = position_ids[torch.where(position_ids == 0)[0][1:] - 1]
-    seq_lens = torch.cat(
-        (seq_lens, torch.tensor([position_ids[-1]], device=seq_lens.device))
-    )
-    seq_lens += 1
-    tot_len = seq_lens.sum().item()
     tot_q = n_queries.sum().item()
 
+    if position_ids is not None:
+        # packed path (train): identical to HEAD — stacks partials across steps
+        # and relies on Python's kwarg-override semantics. Don't reset here:
+        # the train flow worked with stacking before; an explicit reset to
+        # forward_lora_base detaches the autograd graph for some reason and
+        # makes loss.backward() fail with no grad_fn.
+        position_ids = position_ids.squeeze(0)
+        seq_lens = position_ids[torch.where(position_ids == 0)[0][1:] - 1]
+        seq_lens = torch.cat(
+            (seq_lens, torch.tensor([position_ids[-1]], device=seq_lens.device))
+        )
+        seq_lens += 1
+        tot_len = seq_lens.sum().item()
+
+        for layer_idx in layer_indices:
+            idx = layer_idx.item()
+            layer = layers[idx]
+            long_mname = "mlp.down_proj"
+            module = attrgetter(long_mname)(layer)
+            layer_coeffs = coeffs[:, idx, 0, :]
+            module.forward = partial(
+                module.forward,
+                n_queries=n_queries,
+                tot_q=tot_q,
+                seq_lens=seq_lens,
+                tot_len=tot_len,
+                coeffs=layer_coeffs,
+                n_ctx_chunks=n_ctx_chunks,
+                repr_seeds=repr_seeds,
+                generator=generator,
+            )
+        return
+
+    # unpacked path (HF.generate): seq_lens must be recomputed each forward
+    # because kv-cache shrinks x to [bs, 1, d_in] after the first decode step.
+    # Assumes bs == 1 and one query per context (eval_batch_size_gen=1).
     for layer_idx in layer_indices:
         idx = layer_idx.item()
         layer = layers[idx]
-
-        # FIX! hardcoded for down_proj (should wrap into a loop for all modules)
         long_mname = "mlp.down_proj"
         module = attrgetter(long_mname)(layer)
-
-        # FIX! index 0 refers to the single module down_proj
-        # layer_coeffs = combined_coeffs[idx, 0, :]
+        # restore the patched base partial (self/lora_dropout_p/scaling already
+        # bound) before re-wrapping so repeated apply_random_repr calls — one
+        # per eval batch — don't stack per-batch kwargs and conflict on seq_lens.
+        if hasattr(module, "forward_lora_base"):
+            module.forward = module.forward_lora_base
         layer_coeffs = coeffs[:, idx, 0, :]
-        module.forward = partial(
+
+        bound = partial(
             module.forward,
             n_queries=n_queries,
             tot_q=tot_q,
-            seq_lens=seq_lens,
-            tot_len=tot_len,
             coeffs=layer_coeffs,
             n_ctx_chunks=n_ctx_chunks,
             repr_seeds=repr_seeds,
             generator=generator,
-            # layer_idx=idx,
         )
+
+        def make_wrapper(bound_fn):
+            def fn(x, *args, **kwargs):
+                seq_len = x.size(1)
+                seq_lens = torch.full(
+                    (tot_q,), seq_len, device=x.device, dtype=torch.long
+                )
+                tot_len = seq_len * tot_q
+                return bound_fn(
+                    x, *args, seq_lens=seq_lens, tot_len=tot_len, **kwargs
+                )
+            return fn
+
+        module.forward = make_wrapper(bound)

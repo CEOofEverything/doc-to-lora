@@ -761,7 +761,21 @@ def evaluate(
             model_kwargs=model_kwargs,
             use_flash_attn=True,
         )
+        # add_tracker first (it requires a bound method and replaces
+        # base_model.generate with its tracking closure on the instance).
         add_tracker(base_model.generate, "generate")
+        # Then strip ctx_* kwargs so raw HF.generate doesn't reject them. The
+        # eval collator now includes ctx_ids/ctx_attn_mask/n_ctx_chunks in the
+        # batch (need_ctx_ids=True is forced for base-model eval so QA splitting
+        # runs); D2L's ModulatedPretrainedModel consumes those in its own
+        # generate() before reaching base.generate, so this wrapper only fires
+        # for the plain base-model path.
+        _tracked_base_generate = base_model.generate
+        def _base_generate_strip_ctx(*args, **kwargs):
+            for _k in ("ctx_ids", "ctx_attn_mask", "ctx_position_ids", "n_ctx_chunks"):
+                kwargs.pop(_k, None)
+            return _tracked_base_generate(*args, **kwargs)
+        base_model.generate = _base_generate_strip_ctx
         if use_cd := getattr(args, "use_cd", False):
             peft_config = get_lora_config(
                 model_name_or_path,
@@ -836,6 +850,13 @@ def evaluate(
     base_model.config.pad_token_id = tokenizer.pad_token_id
     base_model.generation_config.pad_token_id = tokenizer.pad_token_id
 
+    # Force the QA-splitting path even for plain base-model eval so the dataset
+    # is split into per-question samples (matching D2L geometry). Without this
+    # need_ctx_ids stays False in processing.py and split_too_long_qas is
+    # skipped, leaving 25 multi-turn rows instead of ~534 single-QA samples.
+    if ctx_model_max_len is None:
+        ctx_model_max_len = base_model.config.max_position_embeddings
+
     ctx_tokenizer = tokenizer
     if ctx_name:
         ctx_tokenizer = get_tokenizer(ctx_name, train=False)
@@ -886,11 +907,18 @@ def evaluate(
     #print(f"Answers: {answers}")
 
     # truncating num val samples
+    # Deterministic permutation so different runs (e.g., base vs d2l) sample
+    # the same indices and metrics are apples-to-apples.
+    eval_sample_seed = int(getattr(args, "seed", 42) or 42)
+    eval_rng = np.random.default_rng(eval_sample_seed)
     max_eval_samples_per_ds = getattr(args, "max_val_samples_per_ds", 0)
     if split == "validation" and max_eval_samples_per_ds > 0:
-        print(f"Truncating all validation ds to {max_eval_samples_per_ds} samples")
+        print(
+            f"Truncating all validation ds to {max_eval_samples_per_ds} samples"
+            f" (seed={eval_sample_seed})"
+        )
         for ds_name, ds in datasets.items():
-            val_indices = np.random.permutation(len(ds))[:max_eval_samples_per_ds]
+            val_indices = eval_rng.permutation(len(ds))[:max_eval_samples_per_ds]
             datasets[ds_name] = ds.select(val_indices)
             if ds_name in answers:
                 answers[ds_name] = answers[ds_name].select(val_indices)
@@ -901,9 +929,12 @@ def evaluate(
 
     max_test_samples_per_ds = getattr(args, "max_test_samples_per_ds", 0)
     if split == "test" and max_test_samples_per_ds > 0:
-        print(f"Truncating all test ds to {max_test_samples_per_ds} samples")
+        print(
+            f"Truncating all test ds to {max_test_samples_per_ds} samples"
+            f" (seed={eval_sample_seed})"
+        )
         for ds_name, ds in datasets.items():
-            test_indices = np.random.permutation(len(ds))[:max_test_samples_per_ds]
+            test_indices = eval_rng.permutation(len(ds))[:max_test_samples_per_ds]
             datasets[ds_name] = ds.select(test_indices)
             if ds_name in answers:
                 answers[ds_name] = answers[ds_name].select(test_indices)
